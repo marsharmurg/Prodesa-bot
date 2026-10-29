@@ -19,7 +19,6 @@ def run_web_server():
     app.run(host="0.0.0.0", port=port)
 
 
-# Iniciar el servidor web en un hilo secundario
 threading.Thread(target=run_web_server, daemon=True).start()
 
 # --- CONFIGURACIÓN DEL BOT Y BASE DE DATOS ---
@@ -35,7 +34,6 @@ def get_conn():
 
 def parse_fecha(txt):
     try:
-        # intenta dd/mm/yyyy
         d = datetime.strptime(txt, "%d/%m/%Y")
         return d.strftime("%d/%m/%Y")
     except Exception:
@@ -61,101 +59,30 @@ def init_db():
 init_db()
 
 
+# --- COMANDOS DEL BOT ---
+
+
+@bot.message_handler(commands=["start", "help"])
+def send_welcome(m):
+    texto = (
+        "🤖 *PRODESA BOT - COMANDOS*\n\n"
+        "🔹 *CREAR:* `/nuevo CODIGO MONTO PLAZO CUOTA`[cite: 4]\n"
+        "🔹 *VER:* `/saldo CODIGO`[cite: 4]\n"
+        "🔹 *EDITAR:* `/editar CODIGO MONTO PLAZO CUOTA`[cite: 4]\n"
+        "🔹 *CORREGIR FECHA:* `/fecha CODIGO FECHA` (Ej: `/fecha C001"
+        " 25/10/2026`)\n"
+        "🔹 *BORRAR:* `/eliminar CODIGO`[cite: 4]\n"
+        "🔹 *PAGO:* `/pago CODIGO MONTO`[cite: 4]\n\n"
+        "💡 *Fórmula:* `(Cuota * Plazo) + (Monto * 0.04)`[cite: 4]"
+    )
+    bot.reply_to(m, texto, parse_mode="Markdown")
+
+
 @bot.message_handler(commands=["nuevo"])
 def nuevo(m):
     try:
         p = m.text.split()
-        _, codigo, monto, dias, total, cuota = p
-        monto, dias, total, cuota = (
-            float(monto),
-            int(dias),
-            float(total),
-            float(cuota),
-        )
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO clientes (codigo) VALUES (%s) ON CONFLICT (codigo) DO"
-            " NOTHING",
-            (codigo,),
-        )
-        comision = monto * 0.04
-        fecha_inicio = datetime.now().strftime("%d/%m/%Y")
-        c.execute(
-            "INSERT INTO creditos (codigo, monto, dias, total, cuota, comision,"
-            " saldo, fecha_inicio, estado) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (
-                codigo,
-                monto,
-                dias,
-                total,
-                cuota,
-                comision,
-                total,
-                fecha_inicio,
-                "ACTIVO",
-            ),
-        )
-        conn.commit()
-        bot.reply_to(
-            m,
-            f"✅ CREDITO CREADO\nCliente: {codigo}\nPrestado: ${monto} | Total:"
-            f" ${total}",
-        )
-        c.close()
-        conn.close()
-    except Exception as e:
-        bot.reply_to(
-            m, f"Usa: /nuevo CODIGO MONTO DIAS TOTAL CUOTA\nError: {e}"
-        )
+        _, codigo, monto, dias, cuota = p
+        monto, dias, cuota = float(monto), int(dias), float(cuota)
 
-
-@bot.message_handler(commands=["abono"])
-def abono(m):
-    try:
-        conn = get_conn()
-        c = conn.cursor()
-        p = m.text.split()
-        codigo, monto_abono = p[1], float(p[2])
-        fecha = (
-            parse_fecha(p[3]) + " 12:00"
-            if len(p) > 3
-            else datetime.now().strftime("%d/%m/%Y %H:%M")
-        )
-        c.execute(
-            "SELECT id, saldo FROM creditos WHERE codigo=%s AND estado='ACTIVO'"
-            " ORDER BY id DESC LIMIT 1",
-            (codigo,),
-        )
-        row = c.fetchone()
-        if not row:
-            bot.reply_to(m, f"❌ {codigo} sin activos")
-            c.close()
-            conn.close()
-            return
-        cid, saldo = row
-        nuevo = saldo - monto_abono
-        c.execute("UPDATE creditos SET saldo=%s WHERE id=%s", (nuevo, cid))
-        c.execute(
-            "INSERT INTO abonos (credito_id, codigo, fecha, monto,"
-            " penalizacion, saldo_restante) VALUES (%s,%s,%s,%s,%s,%s)",
-            (cid, codigo, fecha, monto_abono, 0, nuevo),
-        )
-        if nuevo <= 0:
-            c.execute(
-                "UPDATE creditos SET estado='CANCELADO', fecha_fin=%s WHERE"
-                " id=%s",
-                (fecha, cid),
-            )
-        conn.commit()
-        bot.reply_to(
-            m, f"💰 {codigo} abonó ${monto_abono}\nSaldo: ${nuevo:.2f}"
-        )
-        c.close()
-        conn.close()
-    except Exception as e:
-        bot.reply_to(m, f"Error abono: {e}")
-
-
-print("Bot corriendo...")
-bot.infinity_polling()
+        # Cálculo según fórmula: (Cuota *
