@@ -44,16 +44,40 @@ def format_fecha(dt):
     return dt.strftime("%d %m %Y")
 
 
-def calcular_vencimiento(fecha_inicio, dias_plazo, festivos=None):
-    if festivos is None:
-        festivos = []
+def obtener_festivos_locales(year):
+    """Devuelve los festivos nacionales oficiales de El Salvador."""
+    return [
+        f"01 01 {year}",  # Año Nuevo
+        f"01 05 {year}",  # Día del Trabajo
+        f"10 05 {year}",  # Día de la Madre
+        f"17 06 {year}",  # Día del Padre
+        f"05 08 {year}",  # Fiestas Agostinas
+        f"06 08 {year}",  # Fiestas Agostinas (San Salvador)
+        f"15 09 {year}",  # Día de la Independencia
+        f"02 11 {year}",  # Día de los Difuntos
+        f"25 12 {year}",  # Navidad
+    ]
+
+
+def calcular_vencimiento(fecha_inicio, dias_plazo, festivos_extra=None):
+    if festivos_extra is None:
+        festivos_extra = []
+
     actual = fecha_inicio
     dias_contados = 0
+
     while dias_contados < dias_plazo:
         actual += timedelta(days=1)
         str_actual = format_fecha(actual)
-        if actual.weekday() < 5 and str_actual not in festivos:
+        festivos_ano = obtener_festivos_locales(actual.year)
+
+        if (
+            actual.weekday() < 5
+            and str_actual not in festivos_ano
+            and str_actual not in festivos_extra
+        ):
             dias_contados += 1
+
     return actual
 
 
@@ -67,17 +91,29 @@ def obtener_tarifa_penalizacion(monto):
     return 0.0
 
 
+def calcular_calificacion(fallas):
+    """Calcula la calificación según la cantidad de fallas acumuladas."""
+    if fallas == 0:
+        return "AA"
+    elif fallas == 1:
+        return "AB"
+    elif fallas == 2:
+        return "AC"
+    else:
+        return "AD"
+
+
 def init_db():
     conn = get_conn()
     c = conn.cursor()
     c.execute(
         "CREATE TABLE IF NOT EXISTS clientes (codigo TEXT PRIMARY KEY, nombre"
-        " TEXT)"
+        " TEXT, foto_url TEXT)"
     )
     c.execute("""CREATE TABLE IF NOT EXISTS creditos 
-    (id SERIAL PRIMARY KEY, codigo TEXT, monto REAL, dias INTEGER, total REAL, cuota REAL, comision REAL, saldo REAL, fecha_inicio TEXT, fecha_fin TEXT, estado TEXT)""")
+    (id SERIAL PRIMARY KEY, codigo TEXT, num_credito TEXT, monto REAL, dias INTEGER, total REAL, cuota REAL, comision REAL, saldo REAL, fallas INTEGER DEFAULT 0, calificacion TEXT DEFAULT 'AA', fecha_inicio TEXT, fecha_fin TEXT, estado TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS abonos 
-    (id SERIAL PRIMARY KEY, credito_id INTEGER, codigo TEXT, fecha TEXT, monto REAL, penalizacion REAL, saldo_restante REAL)""")
+    (id SERIAL PRIMARY KEY, credito_id INTEGER, codigo TEXT, num_credito TEXT, fecha TEXT, monto REAL, penalizacion REAL, saldo_restante REAL)""")
     c.execute(
         "CREATE TABLE IF NOT EXISTS festivos (fecha TEXT PRIMARY KEY,"
         " descripcion TEXT)"
@@ -99,139 +135,18 @@ def send_welcome(m):
         "🤖 *PRODESA BOT - SISTEMA DE CRÉDITOS*\n\n"
         "🔹 *CREAR:* `/nuevo CODIGO MONTO PLAZO CUOTA [FECHA_INICIO]`\n"
         "🔹 *ESTADO DE CUENTA:* `/saldo CODIGO`\n"
+        "🔹 *HISTORIAL CREDITICIO:* `/historial CODIGO`\n"
         "🔹 *REPORTE DIARIO:* `/reporte` o `/reporte 28 10 2026`\n"
-        "🔹 *EDITAR:* `/editar CODIGO MONTO PLAZO CUOTA`\n"
-        "🔹 *CORREGIR FECHA:* `/fecha CODIGO 28 10 2026`\n"
         "🔹 *PAGO/ABONO:* `/pago CODIGO MONTO [DIAS_RETRASO]`\n"
-        "🔹 *REGISTRAR FESTIVO:* `/festivo 25 12 2026 Navidad`\n"
+        "🔹 *CORREGIR FECHA:* `/fecha CODIGO 28 10 2026`\n"
+        "🔹 *EDITAR:* `/editar CODIGO MONTO PLAZO CUOTA`\n"
+        "🔹 *ASIGNAR FOTO:* `/foto CODIGO URL_DE_FOTO`\n"
+        "🔹 *REGISTRAR FESTIVO EXTRA:* `/festivo 15 04 2026 Descripcion`\n"
         "🔹 *BORRAR:* `/eliminar CODIGO`\n\n"
-        "📌 *Notas:* Formato de fecha `DD MM YYYY`."
+        "📌 *Calificaciones:* AA (0 fallas) | AB (1 falla) | AC (2 fallas) | AD"
+        " (3+ fallas)."
     )
     bot.reply_to(m, texto, parse_mode="Markdown")
-
-
-@bot.message_handler(commands=["saldo"])
-def saldo(m):
-    try:
-        p = m.text.split()
-        codigo = p[1]
-        conn = get_conn()
-        c = conn.cursor()
-
-        c.execute(
-            "SELECT id, monto, dias, cuota, total, saldo, fecha_inicio,"
-            " fecha_fin FROM creditos WHERE codigo=%s AND estado='ACTIVO' ORDER"
-            " BY id DESC LIMIT 1",
-            (codigo,),
-        )
-        row = c.fetchone()
-
-        if not row:
-            bot.reply_to(m, f"❌ El cliente *{codigo}* no tiene crédito activo.")
-            c.close()
-            conn.close()
-            return
-
-        (
-            cid,
-            monto,
-            dias,
-            cuota,
-            total,
-            saldo_actual,
-            fecha_ini,
-            fecha_venc,
-        ) = row
-        tarifa_pen = obtener_tarifa_penalizacion(monto)
-
-        # Consultar historial de abonos
-        c.execute(
-            "SELECT fecha, monto, penalizacion, saldo_restante FROM abonos"
-            " WHERE credito_id=%s ORDER BY id ASC",
-            (cid,),
-        )
-        abonos = c.fetchall()
-
-        msg = (
-            f"📊 *ESTADO DE CUENTA: {codigo}*\n\n"
-            f"🗓️ *Inicio:* {fecha_ini} | *Vencimiento:* {fecha_venc}\n"
-            f"💵 *Monto:* ${monto:.2f} | *Cuota:* ${cuota:.2f}\n"
-            f"💰 *Total Crédito:* ${total:.2f}\n"
-            f"🔴 *SALDO PENDIENTE: ${saldo_actual:.2f}*\n"
-            f"-----------------------------------\n"
-            f"📝 *HISTORIAL DE ABONOS:*\n"
-        )
-
-        if not abonos:
-            msg += "_No hay abonos registrados todavía._\n"
-        else:
-            for a in abonos:
-                f_pago, m_pago, pen_pago, s_pago = a
-                pen_txt = f" (Mora: ${pen_pago:.2f})" if pen_pago > 0 else ""
-                msg += f"• `{f_pago}`: ${m_pago:.2f}{pen_txt} ➔ Queda: ${s_pago:.2f}\n"
-
-        bot.reply_to(m, msg, parse_mode="Markdown")
-        c.close()
-        conn.close()
-    except Exception:
-        bot.reply_to(m, "Usa: `/saldo CODIGO`", parse_mode="Markdown")
-
-
-@bot.message_handler(commands=["reporte"])
-def reporte_diario(m):
-    try:
-        p = m.text.split()
-        if len(p) > 1:
-            fecha_consulta = format_fecha(parse_fecha(" ".join(p[1:])))
-        else:
-            fecha_consulta = format_fecha(datetime.now())
-
-        conn = get_conn()
-        c = conn.cursor()
-
-        c.execute(
-            "SELECT codigo, monto, penalizacion, saldo_restante FROM abonos"
-            " WHERE fecha LIKE %s ORDER BY id ASC",
-            (f"{fecha_consulta}%",),
-        )
-        filas = c.fetchall()
-
-        if not filas:
-            bot.reply_to(
-                m,
-                f"📅 *REPORTE DE COBROS ({fecha_consulta})*\n\n_No se"
-                " registraron cobros en esta fecha._",
-                parse_mode="Markdown",
-            )
-            c.close()
-            conn.close()
-            return
-
-        total_cobrado = 0.0
-        total_penalizaciones = 0.0
-        msg = f"📅 *REPORTE DIARIO DE CARTERA ({fecha_consulta})*\n\n"
-
-        for f in filas:
-            cod, monto, pen, s_rest = f
-            total_cobrado += monto
-            total_penalizaciones += pen
-            mora_txt = f" (Mora: ${pen:.2f})" if pen > 0 else ""
-            msg += f"👤 *{cod}*: ${monto:.2f}{mora_txt} | Saldo: ${s_rest:.2f}\n"
-
-        msg += f"\n-----------------------------------\n"
-        msg += f"💵 *TOTAL COBRADO:* ${total_cobrado:.2f}\n"
-        if total_penalizaciones > 0:
-            msg += f"⚠️ *TOTAL PENALIZACIONES:* ${total_penalizaciones:.2f}\n"
-
-        bot.reply_to(m, msg, parse_mode="Markdown")
-        c.close()
-        conn.close()
-    except Exception:
-        bot.reply_to(
-            m,
-            "Usa: `/reporte` para hoy o `/reporte 28 10 2026` para otra fecha.",
-            parse_mode="Markdown",
-        )
 
 
 @bot.message_handler(commands=["nuevo"])
@@ -246,10 +161,19 @@ def nuevo(m):
 
         conn = get_conn()
         c = conn.cursor()
-        c.execute("SELECT fecha FROM festivos")
-        festivos = [r[0] for r in c.fetchall()]
 
-        dt_vencimiento = calcular_vencimiento(dt_inicio, dias, festivos)
+        # Generar número correlativo de crédito (Ejemplo: C001-1, C001-2)
+        c.execute(
+            "SELECT COUNT(*) FROM creditos WHERE codigo=%s",
+            (codigo,),
+        )
+        conteo = c.fetchone()[0] + 1
+        num_credito = f"{codigo}-{conteo}"
+
+        c.execute("SELECT fecha FROM festivos")
+        festivos_extra = [r[0] for r in c.fetchall()]
+
+        dt_vencimiento = calcular_vencimiento(dt_inicio, dias, festivos_extra)
         fecha_vencimiento_str = format_fecha(dt_vencimiento)
 
         comision = monto * 0.04
@@ -260,17 +184,20 @@ def nuevo(m):
             (codigo,),
         )
         c.execute(
-            "INSERT INTO creditos (codigo, monto, dias, total, cuota, comision,"
-            " saldo, fecha_inicio, fecha_fin, estado) VALUES"
-            " (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+            "INSERT INTO creditos (codigo, num_credito, monto, dias, total,"
+            " cuota, comision, saldo, fallas, calificacion, fecha_inicio,"
+            " fecha_fin, estado) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
             (
                 codigo,
+                num_credito,
                 monto,
                 dias,
                 total,
                 cuota,
                 comision,
                 total,
+                0,
+                "AA",
                 fecha_inicio_str,
                 fecha_vencimiento_str,
                 "ACTIVO",
@@ -283,6 +210,7 @@ def nuevo(m):
         bot.reply_to(
             m,
             f"✅ *CRÉDITO CREADO*\n\n"
+            f"🆔 *N° de Crédito:* `{num_credito}`\n"
             f"👤 *Cliente:* {codigo}\n"
             f"💵 *Monto:* ${monto:.2f}\n"
             f"📅 *Inicio:* {fecha_inicio_str}\n"
@@ -290,6 +218,7 @@ def nuevo(m):
             f"⏱️ *Plazo (L-V):* {dias} días hábiles\n"
             f"💲 *Cuota diaria:* ${cuota:.2f}\n"
             f"💰 *Total a pagar:* ${total:.2f}\n"
+            f"⭐ *Calificación inicial:* AA\n"
             f"⚠️ *Penalización por mora:* ${tarifa_penalizacion:.2f}/día no pagado",
             parse_mode="Markdown",
         )
@@ -314,8 +243,8 @@ def pago(m):
         conn = get_conn()
         c = conn.cursor()
         c.execute(
-            "SELECT id, monto, saldo FROM creditos WHERE codigo=%s AND"
-            " estado='ACTIVO' ORDER BY id DESC LIMIT 1",
+            "SELECT id, num_credito, monto, saldo, fallas FROM creditos WHERE"
+            " codigo=%s AND estado='ACTIVO' ORDER BY id DESC LIMIT 1",
             (codigo,),
         )
         row = c.fetchone()
@@ -326,22 +255,29 @@ def pago(m):
             conn.close()
             return
 
-        cid, monto_credito, saldo_actual = row
+        cid, num_credito, monto_credito, saldo_actual, fallas_actuales = row
         tarifa = obtener_tarifa_penalizacion(monto_credito)
         penalizacion_total = tarifa * dias_retraso
+
+        # Actualizar fallas y calificación
+        nuevas_fallas = fallas_actuales + dias_retraso
+        nueva_calificacion = calcular_calificacion(nuevas_fallas)
 
         nuevo_saldo = (saldo_actual + penalizacion_total) - monto_abono
         fecha_pago_str = format_fecha(datetime.now())
 
         c.execute(
-            "UPDATE creditos SET saldo=%s WHERE id=%s", (nuevo_saldo, cid)
+            "UPDATE creditos SET saldo=%s, fallas=%s, calificacion=%s WHERE"
+            " id=%s",
+            (nuevo_saldo, nuevas_fallas, nueva_calificacion, cid),
         )
         c.execute(
-            "INSERT INTO abonos (credito_id, codigo, fecha, monto,"
-            " penalizacion, saldo_restante) VALUES (%s,%s,%s,%s,%s,%s)",
+            "INSERT INTO abonos (credito_id, codigo, num_credito, fecha, monto,"
+            " penalizacion, saldo_restante) VALUES (%s,%s,%s,%s,%s,%s,%s)",
             (
                 cid,
                 codigo,
+                num_credito,
                 fecha_pago_str,
                 monto_abono,
                 penalizacion_total,
@@ -349,7 +285,9 @@ def pago(m):
             ),
         )
 
+        estado = "ACTIVO"
         if nuevo_saldo <= 0:
+            estado = "CANCELADO"
             c.execute(
                 "UPDATE creditos SET estado='CANCELADO', fecha_fin=%s WHERE"
                 " id=%s",
@@ -360,16 +298,24 @@ def pago(m):
 
         msg = (
             f"💰 *PAGO REGISTRADO*\n\n"
+            f"🆔 *Crédito:* `{num_credito}`\n"
             f"👤 *Cliente:* {codigo}\n"
             f"💵 *Abono:* ${monto_abono:.2f}\n"
         )
         if dias_retraso > 0:
             msg += (
-                f"⚠️ *Días no abonados:* {dias_retraso}\n"
-                f"💸 *Penalización agregada:* ${penalizacion_total:.2f}\n"
+                f"⚠️ *Días no abonados agregados:* {dias_retraso}\n"
+                f"💸 *Penalización:* ${penalizacion_total:.2f}\n"
             )
 
+        msg += (
+            f"⭐ *Calificación actual:* *{nueva_calificacion}* ({nuevas_fallas}"
+            f" fallas acumuladas)\n"
+        )
         msg += f"🔴 *Saldo restante: ${nuevo_saldo:.2f}*"
+
+        if estado == "CANCELADO":
+            msg += f"\n\n🎉 *¡CRÉDITO {num_credito} FINALIZADO Y CANCELADO!*"
 
         bot.reply_to(m, msg, parse_mode="Markdown")
         c.close()
@@ -380,6 +326,210 @@ def pago(m):
             "Usa: `/pago CODIGO MONTO [DIAS_SIN_PAGAR]`",
             parse_mode="Markdown",
         )
+
+
+@bot.message_handler(commands=["saldo"])
+def saldo(m):
+    try:
+        p = m.text.split()
+        codigo = p[1]
+        conn = get_conn()
+        c = conn.cursor()
+
+        c.execute("SELECT foto_url FROM clientes WHERE codigo=%s", (codigo,))
+        res_foto = c.fetchone()
+        foto_url = res_foto[0] if res_foto else None
+
+        c.execute(
+            "SELECT id, num_credito, monto, dias, cuota, total, saldo, fallas,"
+            " calificacion, fecha_inicio, fecha_fin FROM creditos WHERE"
+            " codigo=%s AND estado='ACTIVO' ORDER BY id DESC LIMIT 1",
+            (codigo,),
+        )
+        row = c.fetchone()
+
+        if not row:
+            bot.reply_to(m, f"❌ El cliente *{codigo}* no tiene crédito activo.")
+            c.close()
+            conn.close()
+            return
+
+        (
+            cid,
+            num_credito,
+            monto,
+            dias,
+            cuota,
+            total,
+            saldo_actual,
+            fallas,
+            calif,
+            fecha_ini,
+            fecha_venc,
+        ) = row
+
+        c.execute(
+            "SELECT fecha, monto, penalizacion, saldo_restante FROM abonos"
+            " WHERE credito_id=%s ORDER BY id ASC",
+            (cid,),
+        )
+        abonos = c.fetchall()
+
+        msg = (
+            f"📊 *ESTADO DE CUENTA: {codigo}*\n"
+            f"🆔 *Crédito Activo:* `{num_credito}`\n\n"
+            f"🗓️ *Inicio:* {fecha_ini} | *Vencimiento:* {fecha_venc}\n"
+            f"💵 *Monto:* ${monto:.2f} | *Cuota:* ${cuota:.2f}\n"
+            f"⭐ *Calificación:* *{calif}* ({fallas} fallas)\n"
+            f"💰 *Total Crédito:* ${total:.2f}\n"
+            f"🔴 *SALDO PENDIENTE: ${saldo_actual:.2f}*\n"
+            f"-----------------------------------\n"
+            f"📝 *HISTORIAL DE ABONOS:*\n"
+        )
+
+        if not abonos:
+            msg += "_No hay abonos registrados en este crédito._\n"
+        else:
+            for a in abonos:
+                f_pago, m_pago, pen_pago, s_pago = a
+                pen_txt = f" (Mora: ${pen_pago:.2f})" if pen_pago > 0 else ""
+                msg += f"• `{f_pago}`: ${m_pago:.2f}{pen_txt} ➔ Queda: ${s_pago:.2f}\n"
+
+        if foto_url:
+            bot.send_photo(
+                m.chat.id, foto_url, caption=msg, parse_mode="Markdown"
+            )
+        else:
+            bot.reply_to(m, msg, parse_mode="Markdown")
+
+        c.close()
+        conn.close()
+    except Exception:
+        bot.reply_to(m, "Usa: `/saldo CODIGO`", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["historial"])
+def historial_cliente(m):
+    """Muestra el récord histórico de todos los créditos finalizados o activos del cliente."""
+    try:
+        p = m.text.split()
+        codigo = p[1]
+        conn = get_conn()
+        c = conn.cursor()
+
+        c.execute(
+            "SELECT num_credito, monto, fecha_inicio, fecha_fin, fallas,"
+            " calificacion, estado FROM creditos WHERE codigo=%s ORDER BY id"
+            " ASC",
+            (codigo,),
+        )
+        filas = c.fetchall()
+
+        if not filas:
+            bot.reply_to(
+                m, f"❌ No existen registros de créditos para el cliente {codigo}."
+            )
+            c.close()
+            conn.close()
+            return
+
+        msg = f"📜 *HISTORIAL CREDITICIO GENERAL DE {codigo}*\n\n"
+        for f in filas:
+            num_cred, monto, f_ini, f_fin, fallas, calif, estado = f
+            estado_icon = "🟢" if estado == "ACTIVO" else "✅"
+            msg += (
+                f"{estado_icon} *Crédito:* `{num_cred}`\n"
+                f"• Monto: ${monto:.2f}\n"
+                f"• Período: {f_ini} al {f_fin}\n"
+                f"• Fallas: {fallas} | Calificación final: *{calif}*\n"
+                f"• Estado: {estado}\n"
+                f"-----------------------------------\n"
+            )
+
+        bot.reply_to(m, msg, parse_mode="Markdown")
+        c.close()
+        conn.close()
+    except Exception:
+        bot.reply_to(m, "Usa: `/historial CODIGO`", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["foto"])
+def guardar_foto(m):
+    try:
+        p = m.text.split()
+        codigo, url = p[1], p[2]
+
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute(
+            "UPDATE clientes SET foto_url=%s WHERE codigo=%s", (url, codigo)
+        )
+        conn.commit()
+
+        bot.reply_to(
+            m,
+            f"🖼️ Foto asignada con éxito al cliente *{codigo}*.",
+            parse_mode="Markdown",
+        )
+        c.close()
+        conn.close()
+    except Exception:
+        bot.reply_to(m, "Usa: `/foto CODIGO URL_DE_FOTO`", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["reporte"])
+def reporte_diario(m):
+    try:
+        p = m.text.split()
+        fecha_consulta = (
+            format_fecha(parse_fecha(" ".join(p[1:])))
+            if len(p) > 1
+            else format_fecha(datetime.now())
+        )
+
+        conn = get_conn()
+        c = conn.cursor()
+
+        c.execute(
+            "SELECT num_credito, codigo, monto, penalizacion, saldo_restante"
+            " FROM abonos WHERE fecha LIKE %s ORDER BY id ASC",
+            (f"{fecha_consulta}%",),
+        )
+        filas = c.fetchall()
+
+        if not filas:
+            bot.reply_to(
+                m,
+                f"📅 *REPORTE DE COBROS ({fecha_consulta})*\n\n_No se"
+                " registraron cobros en esta fecha._",
+                parse_mode="Markdown",
+            )
+            c.close()
+            conn.close()
+            return
+
+        total_cobrado = sum(f[2] for f in filas)
+        total_pen = sum(f[3] for f in filas)
+
+        msg = f"📅 *REPORTE DIARIO DE CARTERA ({fecha_consulta})*\n\n"
+        for f in filas:
+            num_cred, cod, monto, pen, s_rest = f
+            mora_txt = f" (Mora: ${pen:.2f})" if pen > 0 else ""
+            msg += (
+                f"👤 `{num_cred}` ({cod}): ${monto:.2f}{mora_txt} | Queda:"
+                f" ${s_rest:.2f}\n"
+            )
+
+        msg += f"\n-----------------------------------\n"
+        msg += f"💵 *TOTAL COBRADO:* ${total_cobrado:.2f}\n"
+        if total_pen > 0:
+            msg += f"⚠️ *TOTAL PENALIZACIONES:* ${total_pen:.2f}\n"
+
+        bot.reply_to(m, msg, parse_mode="Markdown")
+        c.close()
+        conn.close()
+    except Exception:
+        bot.reply_to(m, "Usa: `/reporte [DD MM YYYY]`", parse_mode="Markdown")
 
 
 @bot.message_handler(commands=["fecha"])
@@ -393,8 +543,8 @@ def editar_fecha(m):
         conn = get_conn()
         c = conn.cursor()
         c.execute(
-            "SELECT id, dias FROM creditos WHERE codigo=%s AND estado='ACTIVO'"
-            " ORDER BY id DESC LIMIT 1",
+            "SELECT id, num_credito, dias FROM creditos WHERE codigo=%s AND"
+            " estado='ACTIVO' ORDER BY id DESC LIMIT 1",
             (codigo,),
         )
         row = c.fetchone()
@@ -405,11 +555,11 @@ def editar_fecha(m):
             conn.close()
             return
 
-        cid, dias = row
+        cid, num_credito, dias = row
         c.execute("SELECT fecha FROM festivos")
-        festivos = [r[0] for r in c.fetchall()]
+        festivos_extra = [r[0] for r in c.fetchall()]
 
-        dt_venc = calcular_vencimiento(dt_nueva, dias, festivos)
+        dt_venc = calcular_vencimiento(dt_nueva, dias, festivos_extra)
         venc_str = format_fecha(dt_venc)
 
         c.execute(
@@ -420,7 +570,7 @@ def editar_fecha(m):
         bot.reply_to(
             m,
             f"📅 *FECHA CORREGIDA*\n\n"
-            f"👤 *Cliente:* {codigo}\n"
+            f"🆔 *Crédito:* `{num_credito}`\n"
             f"🗓️ *Nueva Fecha Inicio:* {nueva_fecha_str}\n"
             f"🏁 *Nuevo Vencimiento:* {venc_str}",
             parse_mode="Markdown",
@@ -438,7 +588,7 @@ def agregar_festivo(m):
     try:
         p = m.text.split(maxsplit=2)
         fecha_str = format_fecha(parse_fecha(p[1]))
-        desc = p[2] if len(p) > 2 else "Día Festivo"
+        desc = p[2] if len(p) > 2 else "Día Festivo Especial"
 
         conn = get_conn()
         c = conn.cursor()
@@ -449,7 +599,7 @@ def agregar_festivo(m):
         )
         conn.commit()
         bot.reply_to(
-            m, f"📅 Festivo registrado: *{fecha_str}* ({desc})", parse_mode="Markdown"
+            m, f"📅 Festivo extra registrado: *{fecha_str}* ({desc})", parse_mode="Markdown"
         )
         c.close()
         conn.close()
@@ -466,8 +616,8 @@ def editar(m):
         conn = get_conn()
         c = conn.cursor()
         c.execute(
-            "SELECT id, fecha_inicio FROM creditos WHERE codigo=%s AND"
-            " estado='ACTIVO' ORDER BY id DESC LIMIT 1",
+            "SELECT id, num_credito, fecha_inicio FROM creditos WHERE"
+            " codigo=%s AND estado='ACTIVO' ORDER BY id DESC LIMIT 1",
             (codigo,),
         )
         row = c.fetchone()
@@ -478,13 +628,13 @@ def editar(m):
             conn.close()
             return
 
-        cid, fecha_ini_str = row
+        cid, num_credito, fecha_ini_str = row
         dt_ini = parse_fecha(fecha_ini_str)
 
         c.execute("SELECT fecha FROM festivos")
-        festivos = [r[0] for r in c.fetchall()]
+        festivos_extra = [r[0] for r in c.fetchall()]
 
-        dt_venc = calcular_vencimiento(dt_ini, dias, festivos)
+        dt_venc = calcular_vencimiento(dt_ini, dias, festivos_extra)
         venc_str = format_fecha(dt_venc)
 
         comision = monto * 0.04
@@ -500,7 +650,7 @@ def editar(m):
         bot.reply_to(
             m,
             f"✏️ *CRÉDITO EDITADO*\n\n"
-            f"👤 *Cliente:* {codigo}\n"
+            f"🆔 *Crédito:* `{num_credito}`\n"
             f"💵 *Monto:* ${monto:.2f}\n"
             f"⏱️ *Plazo (L-V):* {dias} días\n"
             f"💲 *Cuota:* ${cuota:.2f}\n"
@@ -525,8 +675,8 @@ def eliminar(m):
         conn = get_conn()
         c = conn.cursor()
         c.execute(
-            "SELECT id FROM creditos WHERE codigo=%s AND estado='ACTIVO' ORDER"
-            " BY id DESC LIMIT 1",
+            "SELECT id, num_credito FROM creditos WHERE codigo=%s AND"
+            " estado='ACTIVO' ORDER BY id DESC LIMIT 1",
             (codigo,),
         )
         row = c.fetchone()
@@ -537,12 +687,12 @@ def eliminar(m):
             conn.close()
             return
 
-        cid = row[0]
+        cid, num_credito = row
         c.execute("DELETE FROM abonos WHERE credito_id=%s", (cid,))
         c.execute("DELETE FROM creditos WHERE id=%s", (cid,))
         conn.commit()
         bot.reply_to(
-            m, f"🗑️ Crédito del cliente {codigo} eliminado correctamente."
+            m, f"🗑️ Crédito `{num_credito}` eliminado correctamente."
         )
         c.close()
         conn.close()
