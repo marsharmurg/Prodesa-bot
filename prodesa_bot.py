@@ -1,70 +1,129 @@
-import os, sqlite3, datetime
+import os
+import sqlite3
+from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import threading
+from flask import Flask
+
+# --- Para que Render no se quede colgado ---
+app = Flask(__name__)
+@app.route('/')
+def home():
+    return "Bot Prodesa activo"
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 TOKEN = os.getenv("BOT_TOKEN")
 DB = "prodesa.db"
 
 def init_db():
-    con = sqlite3.connect(DB)
-    cur = con.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS creditos (id INTEGER PRIMARY KEY AUTOINCREMENT, codigo TEXT, monto REAL, dias INTEGER, total REAL, cuota REAL, saldo REAL, fecha_inicio TEXT, fecha_fin TEXT, estado TEXT)")
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE IF NOT EXISTS creditos (id INTEGER PRIMARY KEY AUTOINCREMENT, codigo TEXT UNIQUE, monto REAL, dias INTEGER, total REAL, cuota REAL, saldo REAL, fecha TEXT)")
     cur.execute("CREATE TABLE IF NOT EXISTS abonos (id INTEGER PRIMARY KEY AUTOINCREMENT, credito_id INTEGER, codigo TEXT, monto REAL, fecha TEXT, tipo TEXT)")
-    con.commit(); con.close()
+    conn.commit()
+    conn.close()
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 PRODESA\n/nuevo CODIGO MONTO DIAS TOTAL CUOTA\n/abono CODIGO MONTO\n/noabono CODIGO\n/saldo CODIGO")
+async def Inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤖 PRODESA\n\n/nuevo CODIGO MONTO DIAS TOTAL CUOTA\n/abono CODIGO MONTO\n/noabono CODIGO\n/saldo CODIGO\n/diario\n/contra\n/recordatorio")
 
-async def nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 5: await update.message.reply_text("Uso: /nuevo CODIGO MONTO DIAS TOTAL CUOTA"); return
+async def Nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 5:
+        await update.message.reply_text("Uso: /nuevo CODIGO MONTO DIAS TOTAL CUOTA")
+        return
     codigo, monto, dias, total, cuota = context.args[0], float(context.args[1]), int(context.args[2]), float(context.args[3]), float(context.args[4])
-    con = sqlite3.connect(DB); cur = con.cursor()
-    hoy = datetime.date.today(); fin = hoy + datetime.timedelta(days=dias)
-    cur.execute("INSERT INTO creditos (codigo, monto, dias, total, cuota, saldo, fecha_inicio, fecha_fin, estado) VALUES (?,?,?,?,?,?,?,?,?)",(codigo, monto, dias, total, cuota, total, hoy.isoformat(), fin.isoformat(), "ACTIVO"))
-    cid = cur.lastrowid; con.commit(); con.close()
-    await update.message.reply_text(f"✅ CREDITO #{cid}\n{codigo} ${monto} -> ${total}\nComision 4%: ${monto*0.04:.2f}")
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    try:
+        cur.execute("INSERT INTO creditos (codigo, monto, dias, total, cuota, saldo, fecha) VALUES (?,?,?,?,?,?,?)",
+                    (codigo, monto, dias, total, cuota, total, datetime.now().strftime("%Y-%m-%d")))
+        conn.commit()
+        await update.message.reply_text(f"✅ Crédito {codigo} guardado")
+    except:
+        await update.message.reply_text("❌ Ese código ya existe")
+    conn.close()
 
-async def abono(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2: await update.message.reply_text("Uso: /abono CODIGO MONTO"); return
+async def Abono(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("Uso: /abono CODIGO MONTO")
+        return
     codigo, monto = context.args[0], float(context.args[1])
-    con = sqlite3.connect(DB); cur = con.cursor()
-    cur.execute("SELECT id, saldo FROM creditos WHERE codigo=? AND estado='ACTIVO' ORDER BY id DESC LIMIT 1", (codigo,))
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("SELECT id, saldo FROM creditos WHERE codigo=?", (codigo,))
     row = cur.fetchone()
-    if not row: await update.message.reply_text("No hay credito activo"); con.close(); return
-    cid, saldo = row; ns = saldo - monto
-    if ns <= 0: cur.execute("UPDATE creditos SET saldo=0, estado='CANCELADO' WHERE id=?", (cid,)); msg="🎉 CANCELADO"
-    else: cur.execute("UPDATE creditos SET saldo=? WHERE id=?", (ns, cid)); msg=f"Saldo ${ns:.2f}"
-    cur.execute("INSERT INTO abonos (credito_id, codigo, monto, fecha, tipo) VALUES (?,?,?,?,?)",(cid, codigo, monto, datetime.datetime.now().isoformat(), "ABONO"))
-    con.commit(); con.close(); await update.message.reply_text(f"✅ ABONO ${monto} {codigo}\n{msg}")
+    if not row:
+        await update.message.reply_text("Código no existe")
+    else:
+        nuevo_saldo = row[1] - monto
+        cur.execute("UPDATE creditos SET saldo=? WHERE id=?", (nuevo_saldo, row[0]))
+        cur.execute("INSERT INTO abonos (credito_id, codigo, monto, fecha, tipo) VALUES (?,?,?,?,?)",
+                    (row[0], codigo, monto, datetime.now().strftime("%Y-%m-%d %H:%M"), "ABONO"))
+        conn.commit()
+        await update.message.reply_text(f"✅ Abono de {monto} a {codigo}. Saldo: {nuevo_saldo}")
+    conn.close()
 
-async def noabono(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 1: await update.message.reply_text("Uso: /noabono CODIGO"); return
-    codigo = context.args[0]; penal=0.45
-    con = sqlite3.connect(DB); cur = con.cursor()
-    cur.execute("SELECT id, saldo FROM creditos WHERE codigo=? AND estado='ACTIVO' ORDER BY id DESC LIMIT 1", (codigo,))
+async def NoAbono(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1:
+        await update.message.reply_text("Uso: /noabono CODIGO")
+        return
+    codigo = context.args[0]
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM creditos WHERE codigo=?", (codigo,))
     row = cur.fetchone()
-    if not row: await update.message.reply_text("No hay credito"); con.close(); return
-    cid, saldo=row; ns=saldo+penal
-    cur.execute("UPDATE creditos SET saldo=? WHERE id=?", (ns, cid))
-    cur.execute("INSERT INTO abonos (credito_id, codigo, monto, fecha, tipo) VALUES (?,?,?,?,?)",(cid, codigo, penal, datetime.datetime.now().isoformat(), "PENALIZACION"))
-    con.commit(); con.close(); await update.message.reply_text(f"⚠️ NO PAGO {codigo}\nPenal ${penal}\nNuevo saldo ${ns:.2f}")
+    if row:
+        cur.execute("INSERT INTO abonos (credito_id, codigo, monto, fecha, tipo) VALUES (?,?,?,?,?)",
+                    (row[0], codigo, 0, datetime.now().strftime("%Y-%m-%d"), "NO ABONO"))
+        conn.commit()
+        await update.message.reply_text(f"⚠️ Registrado NO ABONO para {codigo}")
+    conn.close()
 
-async def saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 1: await update.message.reply_text("Uso: /saldo CODIGO"); return
-    codigo=context.args[0]; con=sqlite3.connect(DB); cur=con.cursor()
-    cur.execute("SELECT id, monto, total, saldo, estado FROM creditos WHERE codigo=? ORDER BY id DESC", (codigo,))
-    rows=cur.fetchall(); con.close()
-    if not rows: await update.message.reply_text("Sin creditos"); return
-    msg=f"📊 {codigo}\n"
-    for r in rows[:10]: msg+=f"#{r[0]} ${r[1]}->{r[2]} Saldo ${r[3]} {r[4]}\n"
-    await update.message.reply_text(msg)
+async def Saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 1:
+        await update.message.reply_text("Uso: /saldo CODIGO")
+        return
+    codigo = context.args[0]
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("SELECT monto, saldo, cuota FROM creditos WHERE codigo=?", (codigo,))
+    row = cur.fetchone()
+    if row:
+        await update.message.reply_text(f"💰 {codigo}\nPrestado: {row[0]}\nSaldo: {row[1]}\nCuota: {row[2]}")
+    else:
+        await update.message.reply_text("No encontrado")
+    conn.close()
 
-if __name__=="__main__":
+async def Diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+    cur.execute("SELECT codigo, saldo, cuota FROM creditos WHERE saldo > 0")
+    rows = cur.fetchall()
+    if not rows:
+        await update.message.reply_text("No hay créditos pendientes")
+    else:
+        texto = "📊 AMORTIZACION DIARIA\n\n"
+        for c,s,q in rows:
+            texto += f"{c} | Saldo: {s} | Cuota: {q}\n"
+        await update.message.reply_text(texto)
+    conn.close()
+
+async def main():
     init_db()
-    app=ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("nuevo", nuevo))
-    app.add_handler(CommandHandler("abono", abono))
-    app.add_handler(CommandHandler("noabono", noabono))
-    app.add_handler(CommandHandler("saldo", saldo))
-    app.run_polling()
+    threading.Thread(target=run_web, daemon=True).start()
+    app_bot = ApplicationBuilder().token(TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", Inicio))
+    app_bot.add_handler(CommandHandler("nuevo", Nuevo))
+    app_bot.add_handler(CommandHandler("abono", Abono))
+    app_bot.add_handler(CommandHandler("noabono", NoAbono))
+    app_bot.add_handler(CommandHandler("saldo", Saldo))
+    app_bot.add_handler(CommandHandler("diario", Diario))
+    app_bot.add_handler(CommandHandler("contra", Diario))
+    app_bot.add_handler(CommandHandler("recordatorio", Diario))
+    await app_bot.run_polling()
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
