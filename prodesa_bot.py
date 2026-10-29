@@ -1,129 +1,97 @@
 import os
-import threading
-import asyncio
-import sqlite3
-from datetime import date, timedelta
-from flask import Flask
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import telebot
+import psycopg2
+from datetime import datetime
 
-app_flask = Flask(__name__)
-@app_flask.route('/')
-def home(): return "Bot Prodesa Live - OK"
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app_flask.run(host='0.0.0.0', port=port)
+TOKEN = os.environ.get('BOT_TOKEN') or 'PEGA_TU_TOKEN_AQUI'
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
-FERIADOS = {
-    date(2025,1,1), date(2025,4,17), date(2025,4,18), date(2025,5,1), date(2025,6,17), date(2025,8,6), date(2025,9,15), date(2025,11,2), date(2025,12,25),
-    date(2026,1,1), date(2026,4,2), date(2026,4,3), date(2026,5,1), date(2026,6,17), date(2026,8,6), date(2026,9,15), date(2026,11,2), date(2026,12,25),
-}
-def es_habil(d: date): return d.weekday() < 5 and d not in FERIADOS
-def add_dias_habiles(inicio: date, dias: int):
-    d = inicio; c = 0
-    while c < dias - 1:
-        d += timedelta(days=1)
-        if es_habil(d): c+=1
-    return d
-def contar_mora(desde: date, hasta: date):
-    mora=0; d=desde+timedelta(days=1)
-    while d <= hasta:
-        if es_habil(d): mora+=1
-        d+=timedelta(days=1)
-    return mora
-def penalizacion_por_monto(monto: float):
-    if 25 <= monto <= 199.99: return 0.45
-    if 200 <= monto <= 399.99: return 0.55
-    if monto >= 400: return 0.90
-    return 0.0
+bot = telebot.TeleBot(TOKEN)
+conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+conn.autocommit = True
+c = conn.cursor()
 
-def db():
-    con = sqlite3.connect("prodesa.db")
-    con.execute("CREATE TABLE IF NOT EXISTS creditos (codigo TEXT PRIMARY KEY, monto REAL, plazo INTEGER, cuota REAL, comision REAL, total_pagar REAL, fecha_otorgamiento TEXT, fecha_vencimiento TEXT)")
-    con.execute("CREATE TABLE IF NOT EXISTS pagos (id INTEGER PRIMARY KEY AUTOINCREMENT, codigo TEXT, monto REAL, fecha TEXT)")
-    return con
+c.execute('''CREATE TABLE IF NOT EXISTS clientes (codigo TEXT PRIMARY KEY, nombre TEXT)''')
+c.execute('''CREATE TABLE IF NOT EXISTS creditos (id SERIAL PRIMARY KEY, codigo TEXT, monto REAL, dias INTEGER, total REAL, cuota REAL, comision REAL, saldo REAL, fecha_inicio TEXT, fecha_fin TEXT, estado TEXT)''')
+c.execute('''CREATE TABLE IF NOT EXISTS abonos (id SERIAL PRIMARY KEY, credito_id INTEGER, codigo TEXT, fecha TEXT, monto REAL, penalizacion REAL, saldo_restante REAL)''')
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "PRODESA SV - CRUD COMPLETO\n\n"
-        "CREAR: /nuevo CODIGO MONTO PLAZO CUOTA\nEj: /nuevo C001 300 30 12\n\n"
-        "VER: /saldo CODIGO\nLISTAR: /clientes\nREPORTE: /reporte_general\n\n"
-        "EDITAR: /editar CODIGO MONTO PLAZO CUOTA\nEj: /editar C001 350 30 13\n\n"
-        "BORRAR: /eliminar CODIGO\n\n"
-        "PAGO: /pago CODIGO MONTO\n\n"
-        "Fórmula: (Cuota*Plazo)+(Monto*0.04)"
-    )
+def parse_fecha(txt):
+    if not txt:
+        return datetime.now().strftime("%d/%m/%Y")
+    return txt
 
-async def nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@bot.message_handler(commands=['nuevo'])
+def nuevo(m):
     try:
-        codigo=context.args[0].upper(); monto=float(context.args[1]); plazo=int(context.args[2]); cuota=float(context.args[3])
-        total_cuotas=cuota*plazo; comision=monto*0.04; total_pagar=total_cuotas+comision; hoy=date.today(); venc=add_dias_habiles(hoy, plazo)
-        con=db(); con.execute("INSERT INTO creditos VALUES (?,?,?,?,?,?,?,?)", (codigo, monto, plazo, cuota, comision, total_pagar, hoy.isoformat(), venc.isoformat())); con.commit(); con.close()
-        await update.message.reply_text(f"✅ {codigo} CREADO\nTotal: ${total_pagar} (Cuotas ${total_cuotas}+Comisión ${comision})\nVence: {venc}")
+        p = m.text.split()
+        if len(p) < 6:
+            bot.reply_to(m, "Usa: /nuevo CODIGO MONTO DIAS TOTAL CUOTA [FECHA]\nEj: /nuevo FMGM0230 100 26 126 4.5 28/10/2025")
+            return
+        _, codigo, monto, dias, total, cuota = p[:6]
+        fecha = parse_fecha(p[6]) if len(p) > 6 else datetime.now().strftime("%d/%m/%Y")
+        monto, dias, total, cuota = float(monto), int(dias), float(total), float(cuota)
+        comision = monto * 0.04
+        c.execute("INSERT INTO clientes (codigo) VALUES (%s) ON CONFLICT (codigo) DO NOTHING", (codigo,))
+        c.execute("INSERT INTO creditos (codigo, monto, dias, total, cuota, comision, saldo, fecha_inicio, estado) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id", (codigo, monto, dias, total, cuota, comision, total, fecha, 'ACTIVO'))
+        cid = c.fetchone()[0]
+        bot.reply_to(m, f"✅ CREDITO #{cid} CREADO\nCliente: {codigo}\nPrestado: ${monto} Total: ${total}\nInicio: {fecha}\nComision: ${comision}\nGuardado para siempre")
     except Exception as e:
-        await update.message.reply_text(f"Error /nuevo CODIGO MONTO PLAZO CUOTA {e}")
+        bot.reply_to(m, f"Error: {e}")
 
-async def editar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@bot.message_handler(commands=['abono'])
+def abono(m):
     try:
-        codigo=context.args[0].upper(); monto=float(context.args[1]); plazo=int(context.args[2]); cuota=float(context.args[3])
-        total_cuotas=cuota*plazo; comision=monto*0.04; total_pagar=total_cuotas+comision
-        con=db(); cur=con.cursor(); existe=cur.execute("SELECT fecha_otorgamiento FROM creditos WHERE codigo=?", (codigo,)).fetchone()
-        if not existe: await update.message.reply_text("Código no existe"); return
-        f_otorg=date.fromisoformat(existe[0]); venc=add_dias_habiles(f_otorg, plazo)
-        con.execute("UPDATE creditos SET monto=?, plazo=?, cuota=?, comision=?, total_pagar=?, fecha_vencimiento=? WHERE codigo=?", (monto, plazo, cuota, comision, total_pagar, venc.isoformat(), codigo)); con.commit(); con.close()
-        await update.message.reply_text(f"✏️ {codigo} ACTUALIZADO\nNuevo Total: ${total_pagar}\nNuevo venc: {venc}")
+        p = m.text.split()
+        codigo, monto_abono = p[1], float(p[2])
+        fecha = parse_fecha(p[3]) + " 12:00" if len(p) > 3 else datetime.now().strftime("%d/%m/%Y %H:%M")
+        c.execute("SELECT id, saldo FROM creditos WHERE codigo=%s AND estado='ACTIVO' ORDER BY id DESC LIMIT 1", (codigo,))
+        row = c.fetchone()
+        if not row:
+            bot.reply_to(m, f"❌ {codigo} sin activos"); return
+        cid, saldo = row
+        nuevo = saldo - monto_abono
+        c.execute("UPDATE creditos SET saldo=%s WHERE id=%s", (nuevo, cid))
+        c.execute("INSERT INTO abonos (credito_id, codigo, fecha, monto, penalizacion, saldo_restante) VALUES (%s,%s,%s,%s,%s,%s)", (cid, codigo, fecha, monto_abono, 0, nuevo))
+        if nuevo <= 0:
+            c.execute("UPDATE creditos SET estado='CANCELADO', fecha_fin=%s WHERE id=%s", (fecha, cid))
+            bot.reply_to(m, f"🎉 CREDITO #{cid} CANCELADO\n{codigo} abonó ${monto_abono} el {fecha}")
+        else:
+            bot.reply_to(m, f"💰 #{cid} {codigo} abonó ${monto_abono}\nFecha: {fecha}\nSaldo: ${nuevo:.2f}")
     except Exception as e:
-        await update.message.reply_text(f"Error /editar CODIGO MONTO PLAZO CUOTA {e}")
+        bot.reply_to(m, f"Error: {e}")
 
-async def eliminar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@bot.message_handler(commands=['noabono'])
+def noabono(m):
     try:
-        codigo=context.args[0].upper()
-        con=db(); con.execute("DELETE FROM creditos WHERE codigo=?", (codigo,)); con.execute("DELETE FROM pagos WHERE codigo=?", (codigo,)); con.commit(); con.close()
-        await update.message.reply_text(f"🗑️ {codigo} ELIMINADO con todos sus pagos")
+        p = m.text.split()
+        codigo = p[1]
+        fecha = parse_fecha(p[2]) + " 12:00" if len(p) > 2 else datetime.now().strftime("%d/%m/%Y %H:%M")
+        c.execute("SELECT id, saldo FROM creditos WHERE codigo=%s AND estado='ACTIVO' ORDER BY id DESC LIMIT 1", (codigo,))
+        row = c.fetchone()
+        if not row: bot.reply_to(m, "No activos"); return
+        cid, saldo = row
+        nuevo = saldo + 0.45
+        c.execute("UPDATE creditos SET saldo=%s WHERE id=%s", (nuevo, cid))
+        c.execute("INSERT INTO abonos (credito_id, codigo, fecha, monto, penalizacion, saldo_restante) VALUES (%s,%s,%s,%s,%s,%s)", (cid, codigo, fecha, 0, 0.45, nuevo))
+        bot.reply_to(m, f"⚠️ #{cid} {codigo} NO PAGÓ\nFecha: {fecha}\n+0.45 | Saldo ${nuevo:.2f}")
     except Exception as e:
-        await update.message.reply_text(f"Error /eliminar CODIGO {e}")
+        bot.reply_to(m, f"Error: {e}")
 
-async def saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@bot.message_handler(commands=['saldo','clientes','lista'])
+def saldo(m):
     try:
-        codigo=context.args[0].upper(); con=db(); cur=con.cursor(); c=cur.execute("SELECT * FROM creditos WHERE codigo=?", (codigo,)).fetchone()
-        if not c: await update.message.reply_text("No existe"); return
-        _, monto, plazo, cuota, comision, total_pagar, f_otorg, f_venc = c; f_venc_d=date.fromisoformat(f_venc); hoy=date.today()
-        pagado=cur.execute("SELECT COALESCE(SUM(monto),0) FROM pagos WHERE codigo=?", (codigo,)).fetchone()[0]
-        dias=contar_mora(f_venc_d, hoy) if hoy>f_venc_d else 0; penal=dias*penalizacion_por_monto(monto); saldo_f=total_pagar-pagado+penal; con.close()
-        await update.message.reply_text(f"💳 {codigo}\nCuota ${cuota} x {plazo} = ${cuota*plazo}\nComisión 4%: ${comision}\nTOTAL: ${total_pagar}\nPagado: ${pagado}\nMora: {dias}d Penal: ${penal:.2f}\n👉 SALDO: ${saldo_f:.2f}")
+        if m.text.startswith('/clientes') or m.text.startswith('/lista'):
+            c.execute("SELECT codigo, COUNT(*), SUM(saldo) FROM creditos WHERE estado='ACTIVO' GROUP BY codigo")
+            rows = c.fetchall()
+            txt = f"📊 CARTERA: ${sum(r[2] or 0 for r in rows):.2f}\n\n"
+            for cod, cnt, sal in rows: txt += f"{cod}: {cnt} cred - ${sal:.2f}\n"
+            bot.reply_to(m, txt or "Sin activos"); return
+        _, codigo = m.text.split()
+        c.execute("SELECT id, monto, total, saldo, fecha_inicio, estado FROM creditos WHERE codigo=%s ORDER BY id DESC", (codigo,))
+        for cid, mo, to, sa, fi, es in c.fetchall():
+            bot.reply_to(m, f"#{cid} ${mo}->{to} Saldo ${sa:.2f} Inicio {fi} {es}")
     except Exception as e:
-        await update.message.reply_text(f"/saldo CODIGO {e}")
+        bot.reply_to(m, f"/saldo CODIGO o /clientes")
 
-async def pago(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        codigo=context.args[0].upper(); monto=float(context.args[1])
-        con=db(); con.execute("INSERT INTO pagos VALUES (NULL,?,?,?)", (codigo, monto, date.today().isoformat())); con.commit(); con.close()
-        await update.message.reply_text(f"Pago ${monto} OK"); await saldo(update, context)
-    except: await update.message.reply_text("/pago CODIGO MONTO")
-
-async def clientes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    con=db(); rows=con.execute("SELECT codigo, total_pagar FROM creditos").fetchall(); con.close()
-    await update.message.reply_text("\n".join([f"{r[0]} - Total ${r[1]}" for r in rows]) if rows else "Sin clientes")
-
-async def reporte_general(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    con=db(); cur=con.cursor(); creditos=cur.execute("SELECT * FROM creditos").fetchall(); txt="📊 REPORTE\n\n"; total=0; mora=0
-    for codigo, monto, plazo, cuota, comision, total_pagar, f_otorg, f_venc in creditos:
-        f_venc_d=date.fromisoformat(f_venc); hoy=date.today(); pag=cur.execute("SELECT COALESCE(SUM(monto),0) FROM pagos WHERE codigo=?", (codigo,)).fetchone()[0]
-        d=contar_mora(f_venc_d, hoy) if hoy>f_venc_d else 0; p=d*penalizacion_por_monto(monto); saldo_f=total_pagar-pag+p; total+=saldo_f
-        if d>0: mora+=1
-        txt+=f"{codigo}: Saldo ${saldo_f:.2f} Mora {d}d\n"
-    txt+=f"\nCartera: ${total:.2f}\nEn mora: {mora}"; con.close(); await update.message.reply_text(txt)
-
-def main():
-    threading.Thread(target=run_flask, daemon=True).start()
-    try: asyncio.set_event_loop(asyncio.new_event_loop())
-    except: pass
-    TOKEN = os.environ.get("BOT_TOKEN")
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start)); app.add_handler(CommandHandler("nuevo", nuevo))
-    app.add_handler(CommandHandler("editar", editar)); app.add_handler(CommandHandler("eliminar", eliminar))
-    app.add_handler(CommandHandler("saldo", saldo)); app.add_handler(CommandHandler("pago", pago))
-    app.add_handler(CommandHandler("clientes", clientes)); app.add_handler(CommandHandler("reporte_general", reporte_general))
-    print("Bot Prodesa corriendo..."); app.run_polling()
-
-if __name__ == "__main__": main()
+print("Bot Prodesa Postgres corriendo...")
+bot.infinity_polling()
