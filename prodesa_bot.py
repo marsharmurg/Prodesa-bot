@@ -1,99 +1,81 @@
+# bot.py - CON COMISIÓN POR OTORGAMIENTO
 import os
 import sqlite3
-from datetime import datetime
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-import threading
-from flask import Flask
 
-# Flask para Render
-app = Flask(__name__)
-@app.route('/')
-def home():
-    return "Bot Prodesa activo"
-def run_web():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-TOKEN = os.getenv("BOT_TOKEN")
-DB = "prodesa.db"
+DB = "creditos.db"
 
 def init_db():
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS creditos (id INTEGER PRIMARY KEY AUTOINCREMENT, codigo TEXT UNIQUE, monto REAL, dias INTEGER, total REAL, cuota REAL, saldo REAL, fecha TEXT)")
-    cur.execute("CREATE TABLE IF NOT EXISTS abonos (id INTEGER PRIMARY KEY AUTOINCREMENT, credito_id INTEGER, codigo TEXT, monto REAL, fecha TEXT, tipo TEXT)")
-    conn.commit()
-    conn.close()
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS creditos (
+        codigo TEXT PRIMARY KEY,
+        monto REAL,
+        total_sin_comision REAL,
+        cuota REAL,
+        dias INTEGER,
+        comision_otorg REAL,
+        saldo_total REAL,
+        saldo_pendiente REAL
+    )""")
+    con.commit()
+    con.close()
 
-async def Inicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 PRODESA\n\n/nuevo CODIGO MONTO DIAS TOTAL CUOTA\n/abono CODIGO MONTO\n/noabono CODIGO\n/saldo CODIGO\n/diario")
+def nuevo_credito(codigo, monto, total_sin, cuota, dias):
+    comision = round(monto * 0.04, 2)  # 4% por otorgamiento
+    saldo_total = round(total_sin + comision, 2)
+    
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute("INSERT OR REPLACE INTO creditos VALUES (?,?,?,?,?,?,?,?)",
+                (codigo, monto, total_sin, cuota, dias, comision, saldo_total, saldo_total))
+    con.commit()
+    con.close()
+    return comision, saldo_total
 
-async def Nuevo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 5:
-        await update.message.reply_text("Uso: /nuevo CODIGO MONTO DIAS TOTAL CUOTA")
-        return
-    codigo, monto, dias, total, cuota = context.args[0], float(context.args[1]), int(context.args[2]), float(context.args[3]), float(context.args[4])
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    try:
-        cur.execute("INSERT INTO creditos (codigo, monto, dias, total, cuota, saldo, fecha) VALUES (?,?,?,?,?,?,?)",
-                    (codigo, monto, dias, total, cuota, total, datetime.now().strftime("%Y-%m-%d")))
-        conn.commit()
-        await update.message.reply_text(f"✅ Crédito {codigo} guardado")
-    except:
-        await update.message.reply_text("❌ Ese código ya existe")
-    conn.close()
-
-async def Abono(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("Uso: /abono CODIGO MONTO")
-        return
-    codigo, monto = context.args[0], float(context.args[1])
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("SELECT id, saldo FROM creditos WHERE codigo=?", (codigo,))
+def abonar(codigo, monto_abono):
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute("SELECT saldo_pendiente FROM creditos WHERE codigo=?", (codigo,))
     row = cur.fetchone()
-    if row:
-        nuevo = row[1] - monto
-        cur.execute("UPDATE creditos SET saldo=? WHERE id=?", (nuevo, row[0]))
-        cur.execute("INSERT INTO abonos (credito_id, codigo, monto, fecha, tipo) VALUES (?,?,?,?,?)",
-                    (row[0], codigo, monto, datetime.now().strftime("%Y-%m-%d %H:%M"), "ABONO"))
-        conn.commit()
-        await update.message.reply_text(f"✅ Abono {monto} a {codigo}. Saldo: {nuevo}")
-    conn.close()
+    if not row:
+        con.close()
+        return None
+    nuevo_saldo = round(row[0] - monto_abono, 2)
+    cur.execute("UPDATE creditos SET saldo_pendiente=? WHERE codigo=?", (nuevo_saldo, codigo))
+    con.commit()
+    con.close()
+    return nuevo_saldo
 
-async def Saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    codigo = context.args[0] if context.args else ""
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("SELECT monto, saldo, cuota FROM creditos WHERE codigo=?", (codigo,))
-    r = cur.fetchone()
-    await update.message.reply_text(f"{codigo} Saldo: {r[1]}" if r else "No encontrado")
-    conn.close()
+def get_credito(codigo):
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute("SELECT * FROM creditos WHERE codigo=?", (codigo,))
+    row = cur.fetchone()
+    con.close()
+    return row
 
-async def Diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute("SELECT codigo, saldo, cuota FROM creditos WHERE saldo > 0")
+def diario():
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute("SELECT codigo, saldo_pendiente, cuota, comision_otorg, total_sin_comision, saldo_total FROM creditos WHERE saldo_pendiente > 0")
     rows = cur.fetchall()
-    txt = "📊 DIARIO\n\n" + "\n".join([f"{c} | Saldo: {s} | Cuota: {q}" for c,s,q in rows]) if rows else "Sin pendientes"
-    await update.message.reply_text(txt)
-    conn.close()
+    con.close()
+    return rows
 
-def main():
-    init_db()
-    threading.Thread(target=run_web, daemon=True).start()
-    application = ApplicationBuilder().token(TOKEN).build()
-    application.add_handler(CommandHandler("start", Inicio))
-    application.add_handler(CommandHandler("nuevo", Nuevo))
-    application.add_handler(CommandHandler("abono", Abono))
-    application.add_handler(CommandHandler("saldo", Saldo))
-    application.add_handler(CommandHandler("diario", Diario))
-    application.add_handler(CommandHandler("contra", Diario))
-    application.add_handler(CommandHandler("recordatorio", Diario))
-    # ESTO ES LO QUE CAMBIA - SIN ASYNCIO
-    application.run_polling()
+# --- HANDLERS PARA TELEGRAM (ejemplo con python-telegram-bot) ---
+# En tu comando /nuevo
+# /nuevo FMGM0230 150 209.65 5.99 35
+# monto=150, total_sin=209.65, cuota=5.99, dias=35
 
-if __name__ == "__main__":
-    main()
+# Mensaje de respuesta para /nuevo:
+# f"✅ Crédito {codigo} guardado\nMonto: {monto}\nTotal s/comisión: {total_sin}\nComisión otorg (4%): {comision}\nSALDO TOTAL A COBRAR: {saldo_total}\nCuota: {cuota}"
+
+# Mensaje para /saldo FMGM0230:
+# f"{codigo}\nSaldo total: {saldo_total} = {total_sin} + {comision} comisión\nPendiente: {saldo_pendiente}\nCuota: {cuota}"
+
+init_db()
+# Mensaje para /saldo FMGM0230:
+# f"{codigo}\nSaldo total: {saldo_total} = {total_sin} + {comision} comisión\nPendiente: {saldo_pendiente}\nCuota: {cuota}"
+
+init_db()
