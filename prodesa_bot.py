@@ -550,7 +550,8 @@ def reporte_diario(m):
         if len(p) > 1:
             fecha_consulta = format_fecha(parse_fecha(" ".join(p[1:])))
         else:
-            fecha_consulta = format_fecha(datetime.now())
+           # Resta 6 horas para ajustar la zona horaria a El Salvador
+            fecha_consulta = format_fecha(datetime.now() - timedelta(hours=6))
 
         conn = get_conn()
         c = conn.cursor()
