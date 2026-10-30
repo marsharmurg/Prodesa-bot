@@ -555,19 +555,20 @@ def reporte_diario(m):
         conn = get_conn()
         c = conn.cursor()
 
+        # Consulta ultra-segura
         c.execute(
             """
             SELECT 
-                COALESCE(num_credito, codigo), 
                 codigo, 
-                COALESCE(monto, 0), 
+                monto, 
                 COALESCE(penalizacion, 0), 
-                COALESCE(saldo_restante, 0) 
+                COALESCE(saldo_restante, 0),
+                COALESCE(num_credito, codigo)
             FROM abonos 
-            WHERE fecha = %s OR fecha LIKE %s
+            WHERE fecha LIKE %s
             ORDER BY id ASC
         """,
-            (fecha_consulta, f"{fecha_consulta}%"),
+            (f"{fecha_consulta}%",),
         )
 
         filas = c.fetchall()
@@ -588,14 +589,18 @@ def reporte_diario(m):
 
         msg = f"📅 *REPORTE DIARIO DE CARTERA ({fecha_consulta})*\n\n"
         for f in filas:
-            num_cred, cod, monto, pen, s_rest = f
-            total_cobrado += float(monto)
-            total_pen += float(pen)
+            cod, monto, pen, s_rest, num_cred = f
+            monto_val = float(monto) if monto else 0.0
+            pen_val = float(pen) if pen else 0.0
+            s_rest_val = float(s_rest) if s_rest else 0.0
 
-            mora_txt = f" (Mora: ${pen:.2f})" if pen > 0 else ""
+            total_cobrado += monto_val
+            total_pen += pen_val
+
+            mora_txt = f" (Mora: ${pen_val:.2f})" if pen_val > 0 else ""
             msg += (
-                f"👤 `{num_cred}` ({cod}): ${monto:.2f}{mora_txt} | Queda:"
-                f" ${s_rest:.2f}\n"
+                f"👤 `{num_cred}` ({cod}): ${monto_val:.2f}{mora_txt} | Queda:"
+                f" ${s_rest_val:.2f}\n"
             )
 
         msg += f"\n-----------------------------------\n"
@@ -609,11 +614,9 @@ def reporte_diario(m):
     except Exception as e:
         bot.reply_to(
             m,
-            f"❌ Error al consultar el reporte: {str(e)}\n\nPrueba usando:"
-            " `/reporte` o `/reporte 29 10 2026`",
+            f"❌ Error al consultar el reporte: {str(e)}",
             parse_mode="Markdown",
         )
-
 
 @bot.message_handler(commands=["fecha"])
 def editar_fecha(m):
